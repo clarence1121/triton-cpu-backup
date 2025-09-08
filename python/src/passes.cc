@@ -22,7 +22,8 @@ void init_triton_analysis(py::module &&m) {
       .def(py::init<mlir::ModuleAllocation *>())
       .def("run", &mlir::ModuleMembarAnalysis::run);
 }
-
+// 以下passes直接來自llvm-project/mlir下面的 可以用using namespace xxxx來判斷
+// /home/wen/Desktop/llvm-project/mlir/lib/Transforms/Utils
 void init_triton_passes_common(py::module &&m) {
   using namespace mlir;
   ADD_PASS_WRAPPER_0("add_sccp", createSCCPPass);
@@ -33,7 +34,11 @@ void init_triton_passes_common(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_licm", createLoopInvariantCodeMotionPass);
   ADD_PASS_WRAPPER_0("print_ir", createPrintIRPass);
 }
-
+// 這裡就是來自triton專案的pass
+// 前面幾個都是定義在transform 也就是跑完後是同一種ir(ttir -> ttir)
+// /home/wen/Desktop/triton-cpu/lib/Dialect/Triton/Transforms
+// 最後那個定義在Conversion裡面以也就是轉換成ttgpuir的pass(ttir -> ttgpuir)
+// /home/wen/Desktop/triton-cpu/lib/Conversion/TritonToTritonGPU
 void init_triton_passes_ttir(py::module &&m) {
   using namespace mlir::triton;
   ADD_PASS_WRAPPER_0("add_combine", createCombineOpsPass);
@@ -46,7 +51,8 @@ void init_triton_passes_ttir(py::module &&m) {
                      createConvertTritonToTritonGPUPass, const std::string &,
                      int, int, int);
 }
-
+// 這裡定義的是轉換成ttgpuir的pass
+// 找不到位置也可以直接點名稱跳轉他會先到一個包裝函數 然後再往下點定義就可以到目的地
 void init_triton_passes_ttgpuir(py::module &&m) {
   using namespace mlir::triton::gpu;
   ADD_PASS_WRAPPER_0("add_coalesce", createTritonGPUCoalesce);
@@ -80,6 +86,8 @@ void init_triton_passes_ttgpuir(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_coalesce_async_copy",
                      createTritonGPUCoalesceAsyncCopy);
 }
+// 你在triton-cpu/python/triton/backends/cpu/compiler.py裡面看到的ttcpuir的pass大部分都是在/home/wen/Desktop/triton-cpu/third_party/cpu/triton_cpu.cc
+// 要隔離開來是因為cpu好像還是實驗性質的
 
 void init_triton_passes_ttcpuir(py::module &&m) {}
 

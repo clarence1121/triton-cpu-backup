@@ -23,6 +23,7 @@ using namespace mlir::triton::cpu;
 
 namespace {
 
+// 回傳函數tt.divisibility=xxx 的值，沒有的話回傳1
 int64_t getDivisibility(Value val) {
   BlockArgument blockArg = dyn_cast<BlockArgument>(val);
   if (!blockArg)
@@ -39,6 +40,7 @@ int64_t getDivisibility(Value val) {
   return 1;
 }
 
+// 回傳val是否一定能被divisor整除
 bool isAlwaysDivisible(Value val, int64_t divisor) {
   if (auto cst = val.getDefiningOp<arith::ConstantOp>()) {
     auto intAttr = dyn_cast<IntegerAttr>(cst.getValue());
@@ -75,8 +77,11 @@ struct CdivToDiv : public OpRewritePattern<arith::DivSIOp> {
     // Looking for a scalar op only.
     if (isa<VectorType>(op.getType()))
       return failure();
-
+    
+    // 被除數 (left-hand side)，對應 IR 裡 divsi %lhs, %rhs 的第一個操作數
     Value lhs = op.getLhs();
+    // 除數 (right-hand side)，對應 IR 裡 divsi %lhs, %rhs 的第二個操作數
+    
     Value rhs = op.getRhs();
     auto addOpDef = lhs.getDefiningOp<arith::AddIOp>();
     auto divisorDef = rhs.getDefiningOp<arith::ConstantOp>();

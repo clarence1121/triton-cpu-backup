@@ -1086,6 +1086,7 @@ LogicalResult AxisInfoAnalysis::visitOperation(
     newContiguity = AxisInfo::DimVectorT(vals.begin(), vals.end());
   }
   if (Attribute attr = op->getDiscardableAttr("tt.divisibility")) {
+    // attr 先轉型成DenseElementAttr再去呼叫模板函數getvalue回傳int array
     auto vals = cast<DenseElementsAttr>(attr).getValues<int>();
     newDivisibility = AxisInfo::DimVectorT(vals.begin(), vals.end());
   }

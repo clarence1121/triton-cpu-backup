@@ -110,8 +110,9 @@ if __name__ == "__main__":
     src = triton.compiler.ASTSource(fn=kernel, constexprs=constants, signature=signature, attrs=attrs)
     opts = {"num_warps": args.num_warps, "num_stages": args.num_stages}
     ccinfo = triton.compile(src, options=opts)
-    if ccinfo.metadata.global_scratch_size > 0:
-        raise RuntimeError("AOT compiling kernels with global scratch requirements is not yet implemented")
+    # if ccinfo.metadata.global_scratch_size > 0:
+    #     raise RuntimeError("AOT compiling kernels with global scratch requirements is not yet implemented")
+
 
     arg_names = []
     arg_types = []

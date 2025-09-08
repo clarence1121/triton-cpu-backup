@@ -85,7 +85,7 @@ def ConvertDotProduct : Pass<"triton-cpu-convert-dot-product", "mlir::ModuleOp">
 
     let options = [
         Option<"useHorizontalSum", "use-horizontal-sum",
-               "bool", /*default*/"true",
+               "bool", /*default*/"false",
                "Use Horizontal Sum kernel for the dot product (gemv). Otherwise use a kernel with packing.">,
     ];
 

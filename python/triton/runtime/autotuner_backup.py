@@ -135,19 +135,10 @@ class Autotuner(KernelInterface):
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
-        # Add shape postfix to the generated directory
-        # FIXME:
-        TUNING_SHAPE_CONFIG=""
-        # TUNING_SHAPE_CONFIG=os.getenv("ENABLE_AUTOTUNING")
-        for k in config.kwargs.keys():
-          TUNING_SHAPE_CONFIG += "_" + str(config.all_kwargs()[k])
-        os.environ["TUNING_SHAPE_CONFIG"] = TUNING_SHAPE_CONFIG
-        # print("set TUNING_SHAPE_CONFIG :", TUNING_SHAPE_CONFIG)
-
         def kernel_call():
-        #     if config.pre_hook:
-        #         config.pre_hook(full_nargs)
-        #     self.pre_hook(full_nargs)
+            if config.pre_hook:
+                config.pre_hook(full_nargs)
+            self.pre_hook(full_nargs)
             try:
                 self.fn.run(
                     *args,
@@ -160,16 +151,10 @@ class Autotuner(KernelInterface):
                     # Throw exception raised by `self.fn.run`
                     raise
 
-            # self.post_hook(full_nargs, exception=None)
+            self.post_hook(full_nargs, exception=None)
 
         try:
-        #     if self.use_cuda_graph:
-        #         return do_bench_cudagraph(kernel_call, rep=self.num_reps, quantiles=(0.5, 0.2, 0.8))
-        #     device = driver.active.get_current_target().backend
-        #     return do_bench(kernel_call, warmup=self.num_warmups, rep=self.num_reps, quantiles=(0.5, 0.2, 0.8),
-        #                     device_type=device)
-            kernel_call()
-            return [float("inf"), float("inf"), float("inf")]
+            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
             if verbose:
                 print(f"Autotuning failed with {e}")
@@ -252,27 +237,20 @@ class Autotuner(KernelInterface):
             config = self.cache[key]
         else:
             config = self.configs[0]
-            # if 'TUNING_SHAPE_CONFIG' in os.environ:
-            #     del os.environ['TUNING_SHAPE_CONFIG']
-            os.environ.pop('TUNING_SHAPE_CONFIG', None)
-            ret = self.fn.run(
-                            *args,
-                            **kwargs,
-                            **config.all_kwargs(),
-                        )
-        # self.best_config = config
-        # if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
-        #     print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
-        #           f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
-        # if config.pre_hook is not None:
-        #     config.pre_hook({**self.nargs, **kwargs, **config.all_kwargs()})
-        # ret = self.fn.run(
-        #     *args,
-        #     **kwargs,
-        #     **config.all_kwargs(),
-        # )
-        # self.nargs = None
-        # return ret
+        self.best_config = config
+        if os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1" and not used_cached_result:
+            print(f"Triton autotuning for function {self.base_fn.__name__} finished after "
+                  f"{self.bench_time:.2f}s; best config selected: {self.best_config};")
+        if config.pre_hook is not None:
+            full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+            config.pre_hook(full_nargs)
+        ret = self.fn.run(
+            *args,
+            **kwargs,
+            **config.all_kwargs(),
+        )
+        self.nargs = None
+        return ret
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
         pruned_configs = self.configs

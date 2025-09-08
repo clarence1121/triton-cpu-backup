@@ -1,4 +1,4 @@
-// RUN: triton-opt %s -test-print-alignment -split-input-file -o /dev/null
+// RUN: triton-opt triton-opt /home/wen/Desktop/triton-cpu/test/Analysis/test-alignment.mlir -test-print-alignment -split-input-file -o /dev/null -test-print-alignment -split-input-file -o /dev/null
 
 tt.func @cast() {
   // expeted-remark @below {{contiguity = [1], divisibility = [1], constancy = [1], constant_value = 1}}

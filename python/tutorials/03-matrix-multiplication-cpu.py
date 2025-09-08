@@ -13,6 +13,7 @@ You will specifically learn about:
 
 * Automatic performance tuning.
 
+* You can change the loop unroll factor in line 170.
 """
 
 # %%
@@ -167,6 +168,7 @@ PAD_B_ONLY = True
 USE_BLOCK_POINTERS = os.getenv("USE_BLOCK_POINTERS", "1") != "0"
 GROUP_SIZE_M = 8
 USE_GPU = False
+LOOP_UNROLL_FACTOR = int(os.getenv("LOOP_UNROLL_FACTOR", "1"))
 
 
 @triton.jit
@@ -199,6 +201,7 @@ def matmul_kernel(
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
         GROUP_SIZE_M: tl.constexpr,  #
         USE_BLOCK_POINTERS: tl.constexpr,  #
+        LOOP_UNROLL_FACTOR: tl.constexpr,  #
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -243,21 +246,25 @@ def matmul_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to matrix C's type after the loop, if C has lower precision type (for example, float16 and bfloat16).
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load the next block of A and B, generate a mask by checking the K dimension.
-        # If it is out of bounds, set it to 0.
-
-        a = tl.load(a_tile_ptr)
-        b = tl.load(b_tile_ptr)
-        # We accumulate along the K dimension.
-        accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
-        # Advance the ptrs to the next K block.
-        if USE_BLOCK_POINTERS:
-            a_tile_ptr = tl.advance(a_tile_ptr, [0, BLOCK_SIZE_K])
-            b_tile_ptr = tl.advance(b_tile_ptr, [BLOCK_SIZE_K, 0])
-        else:
-            a_tile_ptr += BLOCK_SIZE_K * stride_ak
-            b_tile_ptr += BLOCK_SIZE_K * stride_bk
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K), LOOP_UNROLL_FACTOR):
+        # Unroll the inner loop to process multiple K blocks
+        for unroll_idx in range(LOOP_UNROLL_FACTOR):
+            k_idx = k + unroll_idx
+            if k_idx < tl.cdiv(K, BLOCK_SIZE_K):
+                # Load the next block of A and B, generate a mask by checking the K dimension.
+                # If it is out of bounds, set it to 0.
+                a = tl.load(a_tile_ptr)
+                b = tl.load(b_tile_ptr)
+                # We accumulate along the K dimension.
+                accumulator = tl.dot(a, b, accumulator, out_dtype=tl.float32)
+            
+            # Advance the ptrs to the next K block.
+            if USE_BLOCK_POINTERS:
+                a_tile_ptr = tl.advance(a_tile_ptr, [0, BLOCK_SIZE_K])
+                b_tile_ptr = tl.advance(b_tile_ptr, [BLOCK_SIZE_K, 0])
+            else:
+                a_tile_ptr += BLOCK_SIZE_K * stride_ak
+                b_tile_ptr += BLOCK_SIZE_K * stride_bk
 
     # Convert the accumulator to the output matrix C's type if needed.
     c = accumulator
@@ -328,6 +335,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, M: int, N: int, K:
         BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,  #
         GROUP_SIZE_M=GROUP_SIZE_M,  #
         USE_BLOCK_POINTERS=USE_BLOCK_POINTERS,  #
+        LOOP_UNROLL_FACTOR=LOOP_UNROLL_FACTOR,  #
         num_threads=num_threads,  #
     )
     return c
@@ -369,9 +377,10 @@ else:
 # We can now compare the performance of our kernel against that of Pytorch. Here we focus on square matrices,
 # but feel free to arrange this script as you wish to benchmark any other matrix shape.
 
-LINE_VALS = ['triton-cpu-single', 'triton-cpu', 'torch-cpu-native']
-LINE_NAMES = ['TritonCPU 1', 'TritonCPU', 'TorchCPU (native)']
-LINE_STYLES = [('blue', '--'), ('blue', '-'), ('green', '--')]
+# Add different unroll factors to the benchmark
+LINE_VALS = ['triton-cpu-unroll-1', 'triton-cpu-unroll-2', 'triton-cpu-unroll-3', 'triton-cpu-unroll-4', 'torch-cpu-native']
+LINE_NAMES = ['TritonCPU Unroll 1', 'TritonCPU Unroll 2', 'TritonCPU Unroll 3', 'TritonCPU Unroll 4', 'TorchCPU (native)']
+LINE_STYLES = [('blue', '--'), ('red', '--'), ('green', '--'), ('orange', '--'), ('purple', '-')]
 
 if USE_GPU and triton.runtime.driver.get_active_gpus():
     triton.runtime.driver.set_active_to_gpu()
@@ -415,7 +424,7 @@ if USE_GPU and triton.runtime.driver.get_active_gpus():
         ylabel='GFLOPS',  # Label name for the y-axis.
         plot_name=
         # Name for the plot. Used also as a file name for saving the plot.
-        f'matmul-performance-{DTYPE} (USE_BLOCK_POINTERS={USE_BLOCK_POINTERS} CACHE_PADDING={CACHE_PADDING} PREPACKED={PREPACKED} PAD_B_ONLY={PAD_B_ONLY} GROUP_SIZE_M={GROUP_SIZE_M})',
+        f'matmul-performance-{DTYPE}-unroll-comparison (USE_BLOCK_POINTERS={USE_BLOCK_POINTERS} CACHE_PADDING={CACHE_PADDING} PREPACKED={PREPACKED} PAD_B_ONLY={PAD_B_ONLY} GROUP_SIZE_M={GROUP_SIZE_M})',
         args={},  # Values for function arguments not in `x_names` and `y_name`.
     ))
 def benchmark(M, N, K, provider):
@@ -456,11 +465,102 @@ def benchmark(M, N, K, provider):
     elif provider == 'triton-cpu':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul(triton_a, triton_b, triton_c, M, N, K),
                                                      quantiles=quantiles, measure_time_with_hooks=True)
+    elif provider.startswith('triton-cpu-unroll-'):
+        # Extract unroll factor from provider name
+        unroll_factor = int(provider.split('-')[-1])
+        
+        # Temporarily set the unroll factor
+        original_factor = os.environ.get("LOOP_UNROLL_FACTOR", "1")
+        os.environ["LOOP_UNROLL_FACTOR"] = str(unroll_factor)
+        
+        # Clear cache and recompile
+        import shutil
+        cache_dir = os.path.expanduser("~/.triton/cache")
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+        
+        # Re-import the module to get new unroll factor
+        import sys
+        if 'matmul_03' in sys.modules:
+            del sys.modules['matmul_03']
+        
+        # Re-import matmul function
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "matmul_03", 
+            "triton-cpu/python/tutorials/03-matrix-multiplication-cpu.py"
+        )
+        matmul_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(matmul_module)
+        matmul_func = matmul_module.matmul
+        
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: matmul_func(triton_a, triton_b, triton_c, M, N, K),
+            quantiles=quantiles, measure_time_with_hooks=True)
+        
+        # Restore original factor
+        os.environ["LOOP_UNROLL_FACTOR"] = original_factor
     perf = lambda ms: 2 * M * N * K * 1e-9 / (ms * 1e-3)
     return perf(ms), perf(max_ms), perf(min_ms)
 
 
 # %%
-# We can now run the decorated function above. Pass `print_data=True` to see the performance number, `show_plots=True` to plot them, and/or
-# `save_path='/path/to/results/' to save them to disk along with raw CSV data:
-benchmark.run(print_data=True, show_plots=True)
+# Loop Unroll Factor Performance Comparison
+# -----------------------------------------
+#
+# Let's test the effect of different loop unroll factors on performance
+
+def test_loop_unroll_performance():
+    """Test performance with current loop unroll factor for 512x512 matrix"""
+    print(f"\n{'='*60}")
+    print(f"Loop Unroll Factor Performance Test (512x512)")
+    print(f"{'='*60}")
+    
+    # Current unroll factor - modify this value to test different factors
+    current_factor = LOOP_UNROLL_FACTOR
+    matrix_size = 512
+    
+    print(f"Testing with LOOP_UNROLL_FACTOR = {current_factor}")
+    print("-" * 40)
+    
+    # Create test matrices
+    a = torch.randn((matrix_size, matrix_size), device='cpu', dtype=DTYPE)
+    b = torch.randn((matrix_size, matrix_size), device='cpu', dtype=DTYPE)
+    c = torch.zeros((matrix_size, matrix_size), device='cpu', dtype=torch.float32)
+    
+    # Warm up
+    for _ in range(5):
+        matmul(a, b, c, matrix_size, matrix_size, matrix_size)
+    
+    # Benchmark with multiple runs for better accuracy
+    import time
+    num_runs = 100
+    gflops_list = []
+    
+    for run in range(num_runs):
+        start_time = time.time()
+        result = matmul(a, b, c, matrix_size, matrix_size, matrix_size)
+        end_time = time.time()
+        
+        # Calculate GFLOPS for this run
+        flops = 2 * matrix_size * matrix_size * matrix_size
+        gflops = flops / ((end_time - start_time) * 1e9)
+        gflops_list.append(gflops)
+    
+    # Calculate average GFLOPS
+    avg_gflops = sum(gflops_list) / len(gflops_list)
+    min_gflops = min(gflops_list)
+    max_gflops = max(gflops_list)
+    
+    # Print results
+    print(f"Factor {current_factor:2d} | GFLOPS: {avg_gflops:6.2f} (min: {min_gflops:6.2f}, max: {max_gflops:6.2f})")
+    print(f"📊 Based on {num_runs} runs")
+    
+    return avg_gflops
+
+# Run the loop unroll comparison test
+test_loop_unroll_performance()
+
+# %%
+# Run benchmark comparison (optional - comment out if you only want the unroll factor test)
+# benchmark.run(print_data=True, show_plots=True)
