@@ -28,7 +28,7 @@ jobs:
           echo "${{ toJSON(github.event.inputs) }}"
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Python ${{ env.python-verson }}
         uses: actions/setup-python@v5
@@ -56,7 +56,7 @@ jobs:
           - {runner: 'MacOS-latest ARM64', runs_on: ['macos-latest'], target-os: 'macos',  arch: 'arm64'}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -167,7 +167,7 @@ jobs:
       - x86
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
 
