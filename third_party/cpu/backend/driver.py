@@ -89,6 +89,9 @@ def compile_module_from_src(inc, src, kernel_name):
     # spec.loader.exec_module(mod)
     # return mod
 
+# Cache for constexpr values to be used when generating launcher headers
+# LAUNCHER_CONSTEXPR_CACHE = {}
+
 # ------------------------
 # Utils
 # ------------------------
@@ -150,17 +153,48 @@ def ty_to_cpp(ty):
 def make_launcher(constants, signature, ids, kernel_name, constexprs_arg_names):
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors.
-    arg_decls = ', '.join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items())
-    kernel_fn_args = [i for i in signature.keys() if i not in constants]
-    kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
-    kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_fn_args] + ["uint32_t"] * 6)
+    # Exclude all constexpr indices from the runtime signature, regardless of
+    # whether a concrete value was provided in `constants`. This ensures the
+    # generated launcher prototype matches the callsite expectations, as
+    # constexprs are provided via preprocessor defines, not runtime args.
+    all_constexpr_indices = list(ids.get("ids_of_const_exprs", tuple()))
 
-    kernel_constants_declare = "".join(f"extern const int {kernel_name}_{arg_name};\n" for arg_id, arg_name in constexprs_arg_names.items() if isinstance(constants[arg_id], int) )
-    kernel_constants_definition = "".join(f"const int {kernel_name}_{arg_name} = {constants[arg_id]};\n" for arg_id, arg_name in constexprs_arg_names.items() if isinstance(constants[arg_id], int))
+    # 問題
+    # 底下兩個分別是印出constexpr的idx和對應的name印出值的邏輯在下面
+    # debug 印出index(用不到？)
+    # print("all_constexpr_indices",all_constexpr_indices)
+
+    # debug: 印出對應的constexpr name
+    if constexprs_arg_names:
+        constexpr_names = [constexprs_arg_names.get(i, f"<{i}>") for i in all_constexpr_indices]
+        print("all_constexpr_names", constexpr_names)
+    else:
+        constexpr_names = []
+    
+    omp_arg_indices = [i for i in signature.keys() if i not in all_constexpr_indices]
+    arg_decls = ', '.join(f"{ty_to_cpp(signature[i])} arg{i}" for i in omp_arg_indices)
 
 
-    # print(kernel_constants_declare)
-    # print(kernel_constants_definition)
+    # Exclude constexprs (e.g., BLOCK_SIZE) from signature and call; they are defined via #define
+    kernel_user_arg_indices = [i for i in signature.keys() if i not in all_constexpr_indices]
+    # Call site uses only runtime args
+    kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_user_arg_indices)
+    # Prototypes use only runtime args + 6 grid params (x,y,z,gridX,gridY,gridZ)
+    kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_user_arg_indices] + ["uint32_t"] * 6)
+
+    # Generate #define macros directly from provided constants to avoid timing issues
+    # Map indices (handle keys like (9,) and 9) to values
+    index_to_value = {}
+    if isinstance(constants, dict):
+        for k, v in constants.items():
+            idx = k[0] if isinstance(k, tuple) and len(k) == 1 else k
+            index_to_value[idx] = v
+    block_size_defines = "".join(
+        f"#define {constexprs_arg_names.get(i, f'<{i}>')} {index_to_value.get(i, 1)}\n"
+        for i in all_constexpr_indices
+    )
+
+    # Debug prints removed to keep build output clean
 
     inc = f"""
 #include <stdint.h>
@@ -168,13 +202,15 @@ def make_launcher(constants, signature, ids, kernel_name, constexprs_arg_names):
 
 using {kernel_name}_kernel_ptr_t = void(*)({kernel_fn_arg_types});
 
+{block_size_defines}
+
 extern "C"{{
  // Pointer type (=Memref) becomes int64_t + MemRef struct
  // FIXME: understand what this int64_t is used for.
  void({kernel_name})({kernel_fn_arg_types});
 }}
 
-{kernel_constants_declare}
+
 
 void {kernel_name}_omp(uint32_t gridX, uint32_t gridY, uint32_t gridZ,
                         {kernel_name}_kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''});
@@ -188,8 +224,6 @@ void {kernel_name}_omp(uint32_t gridX, uint32_t gridY, uint32_t gridZ,
 #include <algorithm>
 #include <optional>
 #include <stdio.h>
-
-{kernel_constants_definition}
 
 void {kernel_name}_omp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, {kernel_name}_kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
    // TODO: Consider using omp collapse(3) clause for simplicity?
@@ -205,7 +239,7 @@ void {kernel_name}_omp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, {kernel_n
    #pragma omp parallel for schedule(static) num_threads(max_threads.value())
    for (size_t i = 0; i < N; ++i) {{
      const auto [x, y, z] = all_grids[i];
-     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_user_arg_indices) > 0 else ''} x, y, z, gridX, gridY, gridZ);
    }}
  }}
  """
@@ -217,11 +251,80 @@ class CPULauncher(object):
     def __init__(self, src, metadata, name):
         ids = {"ids_of_const_exprs": src.fn.constexprs if hasattr(src, "fn") else tuple()}
         constants = src.constants if hasattr(src, "constants") else dict()
-        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
+        # debug: inspect what Triton passes to the CPU driver
+        try:
+            meta_constants = metadata.get("constants") if isinstance(metadata, dict) else None
+        except Exception:
+            meta_constants = None
 
-        constexprs_arg_names = {cst_key(key): key for key, value in constants.items()  if(cst_key(key) in  src.fn.constexprs)}
+        # 問題
+        # 這裡印出了block_size的資訊
+        # this printing format is like [CPULauncher] raw src.constants = {(9,): 8, (10,): 1, (11,): 8, (12,): 64}
+        # is any way to cast it to launcher.h and change the deifne xxx 1 to the value in src.constants
+        # for example change to define BLOCK_SIZE_OC = 8
+        # define BLOCK_SIZE_H = 1
+        # define BLOCK_SIZE_W = 8
+        # define BLOCK_SIZE_IC = 64
+        # in the header file
+        # Still dont work i think the CPULauncher runs previous than the make_launcher
+        # so the define is not changed in the header file
+        # do the following steps:
+        # so the CPULauncher class is initialized and you should cache the argument in the __init__ function
+        # than the make_launcher function is called and you mmodify make_launcher to read cache and  change the value of the define in the header file according to the result you cached
+        # dont call api in the make_launcher function , you have proved this is not working,so just follow the steps i mentioned above
+        # so two function you should modify are make_launcher and CPULauncher.__init__
+        
+        print(f"[CPULauncher] raw src.constants = {getattr(src, 'constants', None)}")
+        # print(f"[CPULauncher] raw metadata.constants = {meta_constants}")
 
+
+        def cst_key(i):
+            # Normalize keys: (idx,) -> idx, arg-name -> index, int -> int
+            if isinstance(i, tuple) and len(i) == 1:
+                i = i[0]
+            if isinstance(i, str):
+                return src.fn.arg_names.index(i)
+            return i
+
+        # Map all constexpr indices to their arg names, not only those present in constants
+        if hasattr(src, "fn") and hasattr(src.fn, "constexprs"):
+            constexprs_arg_names = {idx: src.fn.arg_names[idx] for idx in src.fn.constexprs}
+        else:
+            constexprs_arg_names = {}
+
+        # Normalize provided constants to index-keyed
         constants = {cst_key(key): value for key, value in constants.items()}
+
+        # # Allow env override for constexprs missing from constants, e.g. KCONST_BLOCK_SIZE_H=64
+        # for idx, arg_name in constexprs_arg_names.items():
+        #     if idx not in constants:
+        #         env_key_kernel = f"KCONST_{name.upper()}_{arg_name.upper()}"
+        #         env_key_plain = f"KCONST_{arg_name.upper()}"
+        #         env_val = os.getenv(env_key_kernel)
+        #         if env_val is None:
+        #             env_val = os.getenv(env_key_plain)
+        #         if env_val is not None:
+        #             try:
+        #                 constants[idx] = int(env_val)
+        #             except ValueError:
+        #                 pass
+
+        # # Persist constexpr name->value mapping for use by make_launcher
+        # name_to_value = {}
+        # for idx, arg_name in constexprs_arg_names.items():
+        #     if idx in constants:
+        #         name_to_value[arg_name] = int(constants[idx])
+
+        # # Store per-kernel mapping so make_launcher can emit #defines with real values
+        # LAUNCHER_CONSTEXPR_CACHE[name] = name_to_value
+
+
+        # # 印出constexpr實際的值
+        # # Print resolved constexprs (values provided by autotune/constants/env)
+        # if constexprs_arg_names:
+        #     msg = ", ".join(f"{arg_name}={constants.get(idx)}" for idx, arg_name in constexprs_arg_names.items())
+        #     print(f"[CPULauncher] {name} constexprs -> {msg}")
+
         signature = {cst_key(key): value for key, value in src.signature.items()}
         inc, src = make_launcher(constants, signature, ids, name, constexprs_arg_names)
         compile_module_from_src(inc, src, name)
