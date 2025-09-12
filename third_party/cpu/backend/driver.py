@@ -37,24 +37,60 @@ if os.path.exists(sys_lib_dir):
     library_dirs.append(sys_lib_dir)
 
 
-def compile_module_from_src(src, name):
-    key = hashlib.md5(src.encode("utf-8")).hexdigest()
-    cache = get_cache_manager(key)
-    cache_path = cache.get_file(f"{name}.so")
-    if cache_path is None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src_path = os.path.join(tmpdir, "main.cpp")
-            with open(src_path, "w") as f:
-                f.write(src)
-            so = _build(name, src_path, tmpdir, library_dirs, include_dirs, libraries)
-            with open(so, "rb") as f:
-                cache_path = cache.put(f.read(), f"{name}.so", binary=True)
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(name, cache_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def compile_module_from_src(inc, src, kernel_name):
+    launcher_include_dir = os.getenv("KERNEL_LAUNCHER_INCLUDE_DIR")
+    launcher_src_dir = os.getenv("KERNEL_AUX_FILE_DIR")
 
+
+    block_shape = os.getenv("TUNING_SHAPE_CONFIG")
+    if block_shape is None:
+        block_shape =""
+
+    if launcher_include_dir is None:
+       launcher_include_dir = tempfile.mkdtemp()
+
+    if launcher_src_dir is None:
+       launcher_src_dir = launcher_include_dir
+
+    # launcher_include_dir +="/" + block_shape
+    # launcher_src_dir +="/" + block_shape
+    # launcher_include_dir += block_shape
+    launcher_src_dir += block_shape
+    os.makedirs(launcher_include_dir, mode=0o777, exist_ok=True)
+    os.makedirs(launcher_src_dir, mode=0o777, exist_ok=True)
+
+
+    # print("launcher include dir: ", launcher_include_dir)
+    # print("launcher src dir: ", launcher_src_dir)
+    inc_path = os.path.join(launcher_include_dir, kernel_name+"_launcher.h")
+    with open(inc_path, "w") as f:
+        f.write(inc)
+
+    src_path = os.path.join(launcher_src_dir, kernel_name+"_launcher.cpp")
+    with open(src_path, "w") as f:
+        f.write(src)
+
+    # key = hashlib.md5(src.encode("utf-8")).hexdigest()
+    # cache = get_cache_manager(key)
+    # cache_path = cache.get_file(f"{name}.so")
+    # if cache_path is None:
+        # with tempfile.TemporaryDirectory() as tmpdir:
+            # tmpdir = tempfile.mkdtemp()
+            # print(tmpdir)
+            # src_path = os.path.join(tmpdir, "main.cpp")
+            # with open(src_path, "w") as f:
+            #     f.write(src)
+            # so = _build(name, src_path, tmpdir, library_dirs, include_dirs, libraries)
+            # with open(so, "rb") as f:
+            #     cache_path = cache.put(f.read(), f"{name}.so", binary=True)
+    # import importlib.util
+    # spec = importlib.util.spec_from_file_location(name, cache_path)
+    # mod = importlib.util.module_from_spec(spec)
+    # spec.loader.exec_module(mod)
+    # return mod
+
+# Cache for constexpr values to be used when generating launcher headers
+# LAUNCHER_CONSTEXPR_CACHE = {}
 
 # ------------------------
 # Utils
@@ -93,6 +129,8 @@ class CPUUtils(object):
 def ty_to_cpp(ty):
     if ty[0] == '*':
         return "void*"
+    if ty == "constexpr":
+        return "int32_t"  # constexpr values are treated as int32_t
     return {
         "i1": "int32_t",
         "i8": "int8_t",
@@ -112,284 +150,189 @@ def ty_to_cpp(ty):
     }[ty]
 
 
-def make_launcher(constants, signature, ids):
+def make_launcher(constants, signature, ids, kernel_name, constexprs_arg_names):
     # Record the end of regular arguments;
     # subsequent arguments are architecture-specific descriptors.
-    def _serialize_signature(sig):
-        if isinstance(sig, tuple):
-            return ','.join(map(_serialize_signature, sig))
-        return sig
+    # Exclude all constexpr indices from the runtime signature, regardless of
+    # whether a concrete value was provided in `constants`. This ensures the
+    # generated launcher prototype matches the callsite expectations, as
+    # constexprs are provided via preprocessor defines, not runtime args.
+    all_constexpr_indices = list(ids.get("ids_of_const_exprs", tuple()))
 
-    def _extracted_type(ty):
-        if isinstance(ty, tuple):
-            val = ','.join(map(_extracted_type, ty))
-            return f"[{val}]"
-        if ty[0] == '*':
-            return "PyObject*"
-        if ty in ("constexpr"):
-            return "PyObject*"
-        return ty_to_cpp(ty)
+    # 問題
+    # 底下兩個分別是印出constexpr的idx和對應的name印出值的邏輯在下面
+    # debug 印出index(用不到？)
+    # print("all_constexpr_indices",all_constexpr_indices)
 
-    def format_of(ty):
-        if isinstance(ty, tuple):
-            val = ''.join(map(format_of, ty))
-            return f"({val})"
-        if ty[0] == '*':
-            return "O"
-        if ty in ("constexpr"):
-            return "O"
-        return {
-            "float": "f",
-            "double": "d",
-            "long": "l",
-            "int8_t": "b",
-            "int16_t": "h",
-            "int32_t": "i",
-            "int64_t": "L",
-            "uint8_t": "B",
-            "uint16_t": "H",
-            "uint32_t": "I",
-            "uint64_t": "K",
-        }[ty_to_cpp(ty)]
+    # debug: 印出對應的constexpr name
+    if constexprs_arg_names:
+        constexpr_names = [constexprs_arg_names.get(i, f"<{i}>") for i in all_constexpr_indices]
+        print("all_constexpr_names", constexpr_names)
+    else:
+        constexpr_names = []
+    
+    omp_arg_indices = [i for i in signature.keys() if i not in all_constexpr_indices]
+    arg_decls = ', '.join(f"{ty_to_cpp(signature[i])} arg{i}" for i in omp_arg_indices)
 
-    args_format = ''.join([format_of(ty) for ty in signature.values()])
-    format = "iiiOKOOOO" + args_format
 
-    signature = ','.join(map(_serialize_signature, signature.values()))
-    signature = list(filter(bool, signature.split(',')))
-    signature = {i: s for i, s in enumerate(signature)}
+    # Exclude constexprs (e.g., BLOCK_SIZE) from signature and call; they are defined via #define
+    kernel_user_arg_indices = [i for i in signature.keys() if i not in all_constexpr_indices]
+    # Call site uses only runtime args
+    kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_user_arg_indices)
+    # Prototypes use only runtime args + 6 grid params (x,y,z,gridX,gridY,gridZ)
+    kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_user_arg_indices] + ["uint32_t"] * 6)
 
-    arg_decls = ', '.join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items() if ty != "constexpr")
+    # Generate #define macros directly from provided constants to avoid timing issues
+    # Map indices (handle keys like (9,) and 9) to values
+    index_to_value = {}
+    if isinstance(constants, dict):
+        for k, v in constants.items():
+            idx = k[0] if isinstance(k, tuple) and len(k) == 1 else k
+            index_to_value[idx] = v
+    block_size_defines = "".join(
+        f"#define {constexprs_arg_names.get(i, f'<{i}>')} {index_to_value.get(i, 1)}\n"
+        for i in all_constexpr_indices
+    )
 
-    arg_ptrs_list = ', '.join(f"&arg{i}" for i in signature.keys())
-    kernel_fn_args = [i for i, ty in signature.items() if i not in constants and ty != "constexpr"]
-    signature_without_constexprs = {i: ty for i, ty in signature.items() if ty != "constexpr"}
-    kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
-    kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_fn_args] + ["uint32_t"] * 6)
+    # Debug prints removed to keep build output clean
+
+    inc = f"""
+#include <stdint.h>
+#include <cstddef>
+
+using {kernel_name}_kernel_ptr_t = void(*)({kernel_fn_arg_types});
+
+{block_size_defines}
+
+extern "C"{{
+ // Pointer type (=Memref) becomes int64_t + MemRef struct
+ // FIXME: understand what this int64_t is used for.
+ void({kernel_name})({kernel_fn_arg_types});
+}}
+
+
+
+void {kernel_name}_omp(uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                        {kernel_name}_kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''});
+"""
 
     # generate glue code
     src = f"""
+#include "{kernel_name}_launcher.h"
+#include "support/omp.h"
+#include "support/support.h"
 #include <algorithm>
-#include <cmath>
-#include <cstddef>
-#include <cstdlib>
-#include <iomanip>
-#include <iostream>
-#ifdef _OPENMP
-#include <omp.h>
-#endif // _OPENMP
 #include <optional>
 #include <stdio.h>
-#include <string>
-#include <memory>
 
-#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
-#include <Python.h>
+void {kernel_name}_omp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, {kernel_name}_kernel_ptr_t kernel_ptr {', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
+   // TODO: Consider using omp collapse(3) clause for simplicity?
+   auto all_grids = get_all_grids(gridX, gridY, gridZ);
+   size_t N = gridX * gridY * gridZ;
 
-inline bool getBoolEnv(const std::string &env) {{
-  const char *s = std::getenv(env.c_str());
-  std::string str(s ? s : "");
-  std::transform(str.begin(), str.end(), str.begin(),
-                 [](unsigned char c) {{ return std::tolower(c); }});
-  return str == "on" || str == "true" || str == "1";
-}}
+   std::optional<int> max_threads = getIntEnv("TRITON_CPU_MAX_THREADS");
+   if (max_threads.has_value())
+     max_threads = std::max(1, std::min(max_threads.value(), omp_get_max_threads()));
+   else
+     max_threads = omp_get_max_threads();
 
-inline std::optional<int64_t> getIntEnv(const std::string &env) {{
-  const char *cstr = std::getenv(env.c_str());
-  if (!cstr)
-    return std::nullopt;
-
-  char *endptr;
-  long int result = std::strtol(cstr, &endptr, 10);
-  if (endptr == cstr)
-    assert(false && "invalid integer");
-  return result;
-}}
-
-using kernel_ptr_t = void(*)({kernel_fn_arg_types});
-
-typedef struct _DevicePtrInfo {{
-  void* dev_ptr;
-  bool valid;
-}} DevicePtrInfo;
-
-static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {{
-  DevicePtrInfo ptr_info;
-  ptr_info.dev_ptr = 0;
-  ptr_info.valid = true;
-  if (PyLong_Check(obj)) {{
-    ptr_info.dev_ptr = (void*) PyLong_AsLongLong(obj);
-    return ptr_info;
-  }}
-  if (obj == Py_None) {{
-    // valid nullptr
-    return ptr_info;
-  }}
-  PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
-  if(ptr){{
-    PyObject *empty_tuple = PyTuple_New(0);
-    PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);
-    Py_DECREF(empty_tuple);
-    Py_DECREF(ptr);
-    if (!PyLong_Check(ret)) {{
-      PyErr_SetString(PyExc_TypeError, "data_ptr method of Pointer object must return 64-bit int");
-      ptr_info.valid = false;
-      return ptr_info;
-    }}
-    ptr_info.dev_ptr = (void*) PyLong_AsLongLong(ret);
-    if(!ptr_info.dev_ptr) {{
-      return ptr_info;
-    }}
-    Py_DECREF(ret);  // Thanks ChatGPT!
-    return ptr_info;
-  }}
-  PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
-  ptr_info.valid = false;
-  return ptr_info;
-}}
-
-static std::unique_ptr<uint32_t[][3]> get_all_grids(uint32_t gridX, uint32_t gridY, uint32_t gridZ) {{
-  std::unique_ptr<uint32_t[][3]> grids(new uint32_t[gridX * gridY * gridZ][3]);
-  // TODO: which order would be more effective for cache locality?
-  for (uint32_t z = 0; z < gridZ; ++z) {{
-    for (uint32_t y = 0; y < gridY; ++y) {{
-      for (uint32_t x = 0; x < gridX; ++x) {{
-        grids[z * gridY * gridX + y * gridX + x][0] = x;
-        grids[z * gridY * gridX + y * gridX + x][1] = y;
-        grids[z * gridY * gridX + y * gridX + x][2] = z;
-      }}
-    }}
-  }}
-  return grids;
-}}
-
-static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
-  // TODO: Consider using omp collapse(3) clause for simplicity?
-  size_t N = gridX * gridY * gridZ;
-  if (N == 1) {{
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} 0, 0, 0, 1, 1, 1);
-      return;
-  }}
-
-  auto all_grids = get_all_grids(gridX, gridY, gridZ);
-  int omp_max_threads = 1;
-  #ifdef _OPENMP
-  omp_max_threads = omp_get_max_threads();
-  #endif // _OPENMP
-  int max_threads = (num_threads > 0) ? num_threads : omp_max_threads;
-
-  // Don't pay OMP overhead price when a single thread is used.
-  if (max_threads == 1) {{
-    for (size_t i = 0; i < N; ++i) {{
-      const auto [x, y, z] = all_grids[i];
-      (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
-    }}
-    return;
-  }}
-
-  // For now, use the default chunk size, total iterations / max_threads.
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(max_threads)
-#endif // _OPENMP
-  for (size_t i = 0; i < N; ++i) {{
-    const auto [x, y, z] = all_grids[i];
-    (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_fn_args) > 0 else ''} x, y, z, gridX, gridY, gridZ);
-  }}
-}}
-
-static PyObject* launch(PyObject* self, PyObject* args) {{
-  int gridX, gridY, gridZ;
-  PyObject *launch_enter_hook = NULL;
-  PyObject *launch_exit_hook = NULL;
-  PyObject *kernel_metadata = NULL;
-  PyObject *launch_metadata = NULL;
-  PyObject *py_obj_stream;
-  void* pKrnl;
-
-  {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
-  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
-                                       &kernel_metadata, &launch_metadata,
-                                       &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
-    return NULL;
-  }}
-
-  void *pStream = PyLong_AsVoidPtr(py_obj_stream);
-  kernel_ptr_t kernel_ptr = reinterpret_cast<kernel_ptr_t>(pKrnl);
-
-  // Extract num_threads metadata.
-  int num_threads = 0;
-  PyObject *num_threads_attr = PyObject_GetAttrString(kernel_metadata, "num_threads");
-  if (num_threads_attr && PyLong_Check(num_threads_attr))
-    num_threads = PyLong_AsLong(num_threads_attr);
-
-  // extract launch metadata
-  if (launch_enter_hook != Py_None){{
-    PyObject* args = Py_BuildValue("(O)", launch_metadata);
-    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
-    Py_DECREF(args);
-    if (!ret)
-      return NULL;
-  }}
-
-  {"; ".join([f"DevicePtrInfo ptr_info{i} = getPointer(arg{i}, {i}); if (!ptr_info{i}.valid) return NULL;" if ty[0] == "*" else "" for i, ty in signature_without_constexprs.items()])};
-  run_omp_kernels(gridX, gridY, gridZ, num_threads, kernel_ptr {(', ' + ', '.join(f"ptr_info{i}.dev_ptr" if ty[0]=="*" else f"arg{i}" for i, ty in signature_without_constexprs.items())) if len(signature_without_constexprs) > 0 else ''});
-
-  if(launch_exit_hook != Py_None){{
-    PyObject* args = Py_BuildValue("(O)", launch_metadata);
-    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
-    Py_DECREF(args);
-    if (!ret)
-      return NULL;
-  }}
-
-  if (PyErr_Occurred()) {{
-    return NULL;
-  }}
-
-  // return None
-  Py_INCREF(Py_None);
-  return Py_None;
-}}
-
-static PyMethodDef ModuleMethods[] = {{
-  {{"launch", launch, METH_VARARGS, "Entry point for all kernels with this signature"}},
-  {{NULL, NULL, 0, NULL}} // sentinel
-}};
-
-static struct PyModuleDef ModuleDef = {{
-  PyModuleDef_HEAD_INIT,
-  \"__triton_cpu_launcher\",
-  NULL, //documentation
-  -1, //size
-  ModuleMethods
-}};
-
-PyMODINIT_FUNC PyInit___triton_cpu_launcher(void) {{
-  PyObject *m = PyModule_Create(&ModuleDef);
-  if(m == NULL) {{
-    return NULL;
-  }}
-  PyModule_AddFunctions(m, ModuleMethods);
-  return m;
-}}
-"""
-    return src
+   #pragma omp parallel for schedule(static) num_threads(max_threads.value())
+   for (size_t i = 0; i < N; ++i) {{
+     const auto [x, y, z] = all_grids[i];
+     (*kernel_ptr)({kernel_fn_args_list + ', ' if len(kernel_user_arg_indices) > 0 else ''} x, y, z, gridX, gridY, gridZ);
+   }}
+ }}
+ """
+    return inc, src
 
 
 class CPULauncher(object):
 
-    def __init__(self, src, metadata):
+    def __init__(self, src, metadata, name):
         ids = {"ids_of_const_exprs": src.fn.constexprs if hasattr(src, "fn") else tuple()}
         constants = src.constants if hasattr(src, "constants") else dict()
-        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
+        # debug: inspect what Triton passes to the CPU driver
+        try:
+            meta_constants = metadata.get("constants") if isinstance(metadata, dict) else None
+        except Exception:
+            meta_constants = None
+
+        # 問題
+        # 這裡印出了block_size的資訊
+        # this printing format is like [CPULauncher] raw src.constants = {(9,): 8, (10,): 1, (11,): 8, (12,): 64}
+        # is any way to cast it to launcher.h and change the deifne xxx 1 to the value in src.constants
+        # for example change to define BLOCK_SIZE_OC = 8
+        # define BLOCK_SIZE_H = 1
+        # define BLOCK_SIZE_W = 8
+        # define BLOCK_SIZE_IC = 64
+        # in the header file
+        # Still dont work i think the CPULauncher runs previous than the make_launcher
+        # so the define is not changed in the header file
+        # do the following steps:
+        # so the CPULauncher class is initialized and you should cache the argument in the __init__ function
+        # than the make_launcher function is called and you mmodify make_launcher to read cache and  change the value of the define in the header file according to the result you cached
+        # dont call api in the make_launcher function , you have proved this is not working,so just follow the steps i mentioned above
+        # so two function you should modify are make_launcher and CPULauncher.__init__
+        
+        print(f"[CPULauncher] raw src.constants = {getattr(src, 'constants', None)}")
+        # print(f"[CPULauncher] raw metadata.constants = {meta_constants}")
+
+
+        def cst_key(i):
+            # Normalize keys: (idx,) -> idx, arg-name -> index, int -> int
+            if isinstance(i, tuple) and len(i) == 1:
+                i = i[0]
+            if isinstance(i, str):
+                return src.fn.arg_names.index(i)
+            return i
+
+        # Map all constexpr indices to their arg names, not only those present in constants
+        if hasattr(src, "fn") and hasattr(src.fn, "constexprs"):
+            constexprs_arg_names = {idx: src.fn.arg_names[idx] for idx in src.fn.constexprs}
+        else:
+            constexprs_arg_names = {}
+
+        # Normalize provided constants to index-keyed
         constants = {cst_key(key): value for key, value in constants.items()}
+
+        # # Allow env override for constexprs missing from constants, e.g. KCONST_BLOCK_SIZE_H=64
+        # for idx, arg_name in constexprs_arg_names.items():
+        #     if idx not in constants:
+        #         env_key_kernel = f"KCONST_{name.upper()}_{arg_name.upper()}"
+        #         env_key_plain = f"KCONST_{arg_name.upper()}"
+        #         env_val = os.getenv(env_key_kernel)
+        #         if env_val is None:
+        #             env_val = os.getenv(env_key_plain)
+        #         if env_val is not None:
+        #             try:
+        #                 constants[idx] = int(env_val)
+        #             except ValueError:
+        #                 pass
+
+        # # Persist constexpr name->value mapping for use by make_launcher
+        # name_to_value = {}
+        # for idx, arg_name in constexprs_arg_names.items():
+        #     if idx in constants:
+        #         name_to_value[arg_name] = int(constants[idx])
+
+        # # Store per-kernel mapping so make_launcher can emit #defines with real values
+        # LAUNCHER_CONSTEXPR_CACHE[name] = name_to_value
+
+
+        # # 印出constexpr實際的值
+        # # Print resolved constexprs (values provided by autotune/constants/env)
+        # if constexprs_arg_names:
+        #     msg = ", ".join(f"{arg_name}={constants.get(idx)}" for idx, arg_name in constexprs_arg_names.items())
+        #     print(f"[CPULauncher] {name} constexprs -> {msg}")
+
         signature = {cst_key(key): value for key, value in src.signature.items()}
-        src = make_launcher(constants, signature, ids)
-        mod = compile_module_from_src(src, "__triton_cpu_launcher")
-        self.launch = mod.launch
+        inc, src = make_launcher(constants, signature, ids, name, constexprs_arg_names)
+        compile_module_from_src(inc, src, name)
+        # self.launch = mod.launch
 
     def __call__(self, *args, **kwargs):
-        self.launch(*args, **kwargs)
+        # self.launch(*args, **kwargs)
+        pass
 
 
 class CPUDeviceInterface:

@@ -52,10 +52,18 @@ namespace py = pybind11;
 void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   using namespace mlir::triton;
 
-  py::enum_<cpu::VecLib>(m, "VecLib")
-      .value("libsleef", cpu::VecLib::Sleef)
-      .value("libmvec", cpu::VecLib::Mvec);
 
+/* auto veclibBinding = py::enum_<cpu::VecLib>(m, "VecLib");
+veclibBinding.value("libsleef", cpu::VecLib::Sleef);
+veclibBinding.value("libmvec", cpu::VecLib::Mvec);*/
+// 等價
+  py::enum_<cpu::VecLib>(m, "VecLib").value("libsleef", cpu::VecLib::Sleef).value("libmvec", cpu::VecLib::Mvec);
+
+// ADD_PASS_WRAPPER_0("add_sccp", createSCCPPass);
+// 另外一個file是用上面巨集的方法定義的展開後
+//   m.def("add_sccp", [](mlir::PassManager &pm) { 
+//     pm.addPass(createSCCPPass()); 
+// });
   py::enum_<cpu::Ukernels>(m, "Ukernels")
       .value("OneDNN", cpu::Ukernels::OneDNN)
       .value("XSMM", cpu::Ukernels::XSMM);

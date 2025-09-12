@@ -33,11 +33,15 @@ namespace {
 // This structure is used to hold candidates for conversion to AMX
 // Mul[F|I]Op operations.
 struct AmxDotOpCandidate {
-  // Operation to convert.
+  // Operation to convert.(要轉換的原始操作)
   cpu::DotOp op;
   // Available LHS, RHS, and accumulator types are limited in AMX and we might
   // require additional casts. Here we keep actual element types used by LHS,
   // RHS, and accumulator in AMX tiles.
+  // 這裡處理的是累加式的乘法做又運算元跟累加器
+  // 的定義是c = a*b+c
+  // 這裡的a是左邊的運算元(lhs)，b是右邊的運算元(rhs)，c是累加器(acc)
+  // 注意這裡c同時是輸出也是輸出
   Type lhsTileElemTy;
   Type rhsTileElemTy;
   Type accTileElemTy;

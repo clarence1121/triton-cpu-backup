@@ -635,21 +635,6 @@ class JITFunction(KernelInterface[T]):
             kernel_cache[key] = kernel
             self._call_hook(key, signature, device, constexprs, options, [attrs], warmup, before=False)
 
-        launcher_src_dir = os.getenv("KERNEL_AUX_FILE_DIR")
-        block_shape = os.getenv("TUNING_SHAPE_CONFIG")
-        # print("get TUNING_SHAPE_CONFIG :", block_shape)
-        if block_shape is None:
-            block_shape = ""
-
-        if launcher_src_dir is not None:
-            # launcher_src_dir +="/" + block_shape
-            launcher_src_dir +=block_shape
-            os.makedirs(launcher_src_dir, mode=0o777, exist_ok=True)
-            llir_path = os.path.join(launcher_src_dir, kernel.name + ".llir")
-            # print("llir_path: ", llir_path)
-            with open(llir_path, "w") as f:
-                f.write(kernel.asm["llir"])
-
         # Check that used global values have not changed.
         not_present = object()
         for (name, _), (val, globals_dict) in self.used_global_vals.items():

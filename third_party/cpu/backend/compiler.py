@@ -153,6 +153,7 @@ class CPUBackend(BaseBackend):
     @staticmethod
     def make_ttir(mod, metadata, opt):
         # This is the same as the Nvidia backend.
+        # 定義在
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
@@ -162,6 +163,7 @@ class CPUBackend(BaseBackend):
         passes.common.add_cse(pm)
         passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
+        passes.ttir.add_loop_unroll(pm)
         pm.run(mod)
         return mod
 
@@ -170,8 +172,12 @@ class CPUBackend(BaseBackend):
         # TTIR -> TTCIR
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        # command line name = --triton-cpu-xxx
+        # 例如第一個應該要叫做 --triton-cpu-scalarize
         cpu.passes.ttcpuir.add_scalarize(pm, True)
+    
         cpu.passes.ttcpuir.add_convert_memory_ops(pm, True)
+        # triton-cpu-convert-ptr-ops
         cpu.passes.ttcpuir.add_convert_ptr_ops(pm)
         cpu.passes.ttcpuir.add_convert_elementwise_ops(pm)
         cpu.passes.ttcpuir.add_convert_elem_manip_ops(pm)
@@ -184,6 +190,7 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_convert_debug_ops(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
+        # --canonicalize
         passes.common.add_canonicalizer(pm)
         pm.run(mod)
         metadata["cluster_dims"] = (opt.cluster_dims[0], opt.cluster_dims[1], opt.cluster_dims[2])
@@ -196,6 +203,7 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
+        # to read2
         if (ukernels := opt.get_ukernels()):
             # For further analysis simplification
             cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)
@@ -204,6 +212,7 @@ class CPUBackend(BaseBackend):
             passes.common.add_cse(pm)
         convert_bf16_dot_product = ((self.cpu_arch == "aarch64" or self.cpu_arch == "armv8")
                                     and 'fp-armv8' in self.cpu_features and 'neon' in self.cpu_features)
+        # to read3
         if convert_bf16_dot_product:
             use_horizontal_sum = os.getenv("TRITON_CPU_DOT_PROD_HORIZ_SUM", "1") == "1"
             cpu.passes.ttcpuir.add_convert_dot_product(pm, use_horizontal_sum)
@@ -213,19 +222,29 @@ class CPUBackend(BaseBackend):
             # FP16 support is not in AMX dialect yet
             amx_fp16 = False
             amx_bf16 = 'amx-bf16' in self.cpu_features
+            # to read
             cpu.passes.ttcpuir.add_convert_dot_to_amx(pm, amx_int8, amx_fp16, amx_bf16)
         if 'avx512f' in self.cpu_features:
             cpu.passes.ttcpuir.add_convert_dot_to_fma(pm)
         cpu.passes.ttcpuir.add_convert_dot_generic(pm)
+
+        #################################
+        # if 'rvv' in self.cpu_features:
+        #     # 這裡假設你有一個專屬的 pass，例如 add_convert_dot_to_rvv
+        #     cpu.passes.ttcpuir.add_convert_dot_to_rvv(pm)
+        ################################
+        
         promote_bf16_to_fp32 = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
         # We don't have any lowering for mixed precision matmuls, so always use casts for now
         convert_mixed_precision_matmul = True
         # We don't have math lib functions for FP8, FP16, BF16. Promote such operations to FP32.
         promote_lib_math_to_fp32 = True
+        # triton-cpu-add-casts-for-unsupported-ops 
         cpu.passes.ttcpuir.add_convert_unsupported_ops(pm, promote_bf16_to_fp32, convert_mixed_precision_matmul,
                                                        promote_lib_math_to_fp32)
         decompose_bf16_conv = self.cpu_arch == "x86_64" and "avx512bf16" not in self.cpu_features
         decompose_fp8_conv = True
+        # triton-cpu-decompose-fp-conversions
         cpu.passes.ttcpuir.add_decompose_fp_conversions(pm, decompose_bf16_conv, decompose_fp8_conv)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
@@ -247,15 +266,26 @@ class CPUBackend(BaseBackend):
             cpu.passes.ttcpuir.add_ukernels_to_onednn_llvmir(pm)
         if options.get_ukernels() == Ukernels.XSMM:
             cpu.passes.ttcpuir.add_ukernels_to_xsmm_llvmir(pm)
+        # triton-cpu-lower-multi-reduction
         cpu.passes.ttcpuir.add_lower_vector_multi_dim(pm)
+        # expand-strided-metadata
         cpu.passes.ttcpuir.add_expand_strided_metadata(pm)
+        # to read4
+        # convert-vector-to-scf
         cpu.passes.ttcpuir.add_vector_to_scf(pm, True, 1, False)
+        # lower-affine
         cpu.passes.ttcpuir.add_lower_affine(pm)
+        # convert-scf-to-cf
         passes.convert.add_scf_to_cf(pm)
+        # convert-index-to-llvm
         passes.convert.add_index_to_llvmir(pm)
+        # triton-cpu-func-op-to-llvm  
         cpu.passes.ttcpuir.add_func_op_to_llvmir(pm)
+        # triton-cpu-get-program-id-op-to-llvm
         cpu.passes.ttcpuir.add_program_id_to_llvmir(pm)
+        # triton-cpu-memory-op-to-llvm
         cpu.passes.ttcpuir.add_memory_op_to_llvmir(pm)
+        # 
         cpu.passes.ttcpuir.add_atomic_ops_to_llvmir(pm)
         cpu.passes.ttcpuir.add_debug_ops_to_llvmir(pm)
 
@@ -268,6 +298,7 @@ class CPUBackend(BaseBackend):
 
         passes.convert.add_math_to_llvmir(pm)
         cpu.passes.ttcpuir.add_math_to_libm(pm)
+        # to read5
         cpu.passes.ttcpuir.add_vector_to_llvmir(pm, options.enable_fast_math)
         cpu.passes.ttcpuir.add_memref_to_llvmir(pm)
         passes.convert.add_reconcile_unrealized(pm)
@@ -325,8 +356,8 @@ class CPUBackend(BaseBackend):
         stages["ttcir"] = lambda src, metadata: self.make_ttcir(src, metadata, options)
         stages["tttcir"] = lambda src, metadata: self.make_tttcir(src, metadata, options)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
-        stages["asm"] = lambda src, metadata: self.make_asm(src, metadata, options)
-        stages["so"] = lambda src, metadata: self.make_so(src, metadata, options)
+        # stages["asm"] = lambda src, metadata: self.make_asm(src, metadata, options)
+        # stages["so"] = lambda src, metadata: self.make_so(src, metadata, options)
 
     @functools.lru_cache()
     def hash(self):
